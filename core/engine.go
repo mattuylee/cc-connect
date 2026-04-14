@@ -2416,7 +2416,7 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 		}
 		hasPrev = true
 	}
-	if answer != "" {
+	if strings.TrimSpace(answer) != "" {
 		if hasPrev {
 			sb.WriteString("\n---\n\n")
 		}
