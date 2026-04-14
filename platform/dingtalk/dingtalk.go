@@ -198,6 +198,12 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel) {
 		return
 	}
 
+	// Handle image messages
+	if data.Msgtype == "picture" {
+		p.handleImageMessage(data, sessionKey)
+		return
+	}
+
 	// Handle text messages (default)
 	msg := &core.Message{
 		SessionKey: sessionKey,
@@ -289,14 +295,58 @@ func (p *Platform) handleAudioMessage(data *chatbot.BotCallbackDataModel, sessio
 	p.handler(p, msg)
 }
 
-func (p *Platform) downloadAudio(downloadCode string) ([]byte, string, error) {
-	// Get download URL
+func (p *Platform) handleImageMessage(data *chatbot.BotCallbackDataModel, sessionKey string) {
+	slog.Debug("dingtalk: image message received", "user", data.SenderNick)
+
+	imgData, ok := data.Content.(map[string]interface{})
+	if !ok {
+		slog.Error("dingtalk: invalid image content type", "type", fmt.Sprintf("%T", data.Content))
+		return
+	}
+
+	downloadCode, _ := imgData["downloadCode"].(string)
+	if downloadCode == "" {
+		slog.Error("dingtalk: image message missing downloadCode")
+		return
+	}
+
+	imgBytes, mimeType, err := p.downloadMedia(downloadCode)
+	if err != nil {
+		slog.Error("dingtalk: failed to download image", "error", err)
+		return
+	}
+
+	if !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/jpeg"
+	}
+
+	slog.Info("dingtalk: image downloaded successfully", "size", len(imgBytes), "mime", mimeType)
+
+	msg := &core.Message{
+		SessionKey: sessionKey,
+		Platform:   "dingtalk",
+		UserID:     data.SenderStaffId,
+		UserName:   data.SenderNick,
+		ChatName:   data.ConversationTitle,
+		MessageID:  data.MsgId,
+		ReplyCtx: replyContext{
+			sessionWebhook: data.SessionWebhook,
+			conversationId: data.ConversationId,
+			senderStaffId:  data.SenderStaffId,
+			isGroup:        data.ConversationType == "2",
+		},
+		Images: []core.ImageAttachment{{MimeType: mimeType, Data: imgBytes}},
+	}
+
+	p.handler(p, msg)
+}
+
+func (p *Platform) downloadMedia(downloadCode string) ([]byte, string, error) {
 	downloadURL, err := p.getDownloadURL(downloadCode)
 	if err != nil {
 		return nil, "", fmt.Errorf("get download URL: %w", err)
 	}
 
-	// Download audio file
 	resp, err := p.httpClient.Get(downloadURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("http get: %w", err)
@@ -312,12 +362,18 @@ func (p *Platform) downloadAudio(downloadCode string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("read response: %w", err)
 	}
 
-	// Determine MIME type from Content-Type header
 	mimeType := resp.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "audio/amr" // Default to AMR if not specified
-	}
+	return data, mimeType, nil
+}
 
+func (p *Platform) downloadAudio(downloadCode string) ([]byte, string, error) {
+	data, mimeType, err := p.downloadMedia(downloadCode)
+	if err != nil {
+		return nil, "", err
+	}
+	if mimeType == "" {
+		mimeType = "audio/amr"
+	}
 	return data, mimeType, nil
 }
 
