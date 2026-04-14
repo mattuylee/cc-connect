@@ -2395,22 +2395,30 @@ type cardToolEntry struct {
 // buildCardContent constructs the full markdown for the streaming card.
 func buildCardContent(thinking string, tools []cardToolEntry, answer string) string {
 	var sb strings.Builder
+	hasPrev := false
 	if thinking != "" {
 		sb.WriteString("💭 **Thinking**\n\n")
 		sb.WriteString(thinking)
-		sb.WriteString("\n\n---\n\n")
+		sb.WriteString("\n")
+		hasPrev = true
 	}
-	for _, t := range tools {
-		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
-		if t.Input != "" {
-			sb.WriteString(t.Input)
+	if len(tools) > 0 {
+		if hasPrev {
+			sb.WriteString("\n---\n\n")
+		}
+		for _, t := range tools {
+			sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
+			if t.Input != "" {
+				sb.WriteString(t.Input)
+				sb.WriteString("\n")
+			}
 			sb.WriteString("\n")
 		}
-		sb.WriteString("\n")
+		hasPrev = true
 	}
 	if answer != "" {
-		if len(tools) > 0 || thinking != "" {
-			sb.WriteString("---\n\n")
+		if hasPrev {
+			sb.WriteString("\n---\n\n")
 		}
 		sb.WriteString(answer)
 	}
