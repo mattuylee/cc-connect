@@ -211,8 +211,8 @@ type Engine struct {
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
-	observeProjectDir string             // ~/.claude/projects/{projectKey}
-	observeSessionKey string             // e.g. "slack:C123:U456" — target for forwarding
+	observeProjectDir string // ~/.claude/projects/{projectKey}
+	observeSessionKey string // e.g. "slack:C123:U456" — target for forwarding
 	observeCancel     context.CancelFunc
 
 	// Interactive agent session management
@@ -2385,6 +2385,38 @@ func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession Ag
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
+// cardToolEntry stores a tool call record for card content rendering.
+type cardToolEntry struct {
+	Index int
+	Name  string
+	Input string
+}
+
+// buildCardContent constructs the full markdown for the streaming card.
+func buildCardContent(thinking string, tools []cardToolEntry, answer string) string {
+	var sb strings.Builder
+	if thinking != "" {
+		sb.WriteString("💭 **Thinking**\n\n")
+		sb.WriteString(thinking)
+		sb.WriteString("\n\n---\n\n")
+	}
+	for _, t := range tools {
+		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
+		if t.Input != "" {
+			sb.WriteString(t.Input)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	if answer != "" {
+		if len(tools) > 0 || thinking != "" {
+			sb.WriteString("---\n\n")
+		}
+		sb.WriteString(answer)
+	}
+	return sb.String()
+}
+
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
 	var textParts []string
 	var segmentStart int // index into textParts: text before this has been sent/displayed
@@ -2415,6 +2447,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		return e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
+
+	// Streaming card: aggregate the whole turn into one updatable card.
+	var streamCard StreamingCard
+	var cardToolCalls []cardToolEntry
+	var cardThinkingText string
+	var cardAnswerText strings.Builder
+	renderCardContent := func(answer string) string {
+		return workspaceRenderer(buildCardContent(cardThinkingText, cardToolCalls, answer))
+	}
+
+	if scp, ok := state.platform.(StreamingCardPlatform); ok {
+		if sc, err := scp.CreateStreamingCard(e.ctx, state.replyCtx); err != nil {
+			slog.Warn("streaming card creation failed, falling back to normal messages", "error", err)
+		} else {
+			streamCard = sc
+			slog.Info("streaming card created for turn", "session", sessionKey)
+		}
+	}
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
 
@@ -2506,6 +2556,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		switch event.Type {
 		case EventThinking:
 			if e.display.ThinkingMessages && event.Content != "" {
+				if streamCard != nil && !streamCard.Failed() {
+					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
+					_ = streamCard.Update(e.ctx, renderCardContent(cardAnswerText.String()))
+					continue
+				}
 				// Flush accumulated text segment before thinking display
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
@@ -2533,6 +2588,32 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventToolUse:
 			toolCount++
 			if e.display.ToolMessages {
+				if streamCard != nil && !streamCard.Failed() {
+					toolInput := event.ToolInput
+					var formattedInput string
+					if toolInput == "" {
+						formattedInput = ""
+					} else if strings.Contains(toolInput, "```") {
+						formattedInput = toolInput
+					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
+						lang := toolCodeLang(event.ToolName, toolInput)
+						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
+					} else {
+						switch event.ToolName {
+						case "shell", "run_shell_command", "Bash":
+							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
+						default:
+							formattedInput = fmt.Sprintf("`%s`", toolInput)
+						}
+					}
+					cardToolCalls = append(cardToolCalls, cardToolEntry{
+						Index: toolCount,
+						Name:  event.ToolName,
+						Input: formattedInput,
+					})
+					_ = streamCard.Update(e.ctx, renderCardContent(cardAnswerText.String()))
+					continue
+				}
 				// Flush accumulated text segment before tool display
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
@@ -2605,8 +2686,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventText:
 			if event.Content != "" {
-				textParts = append(textParts, event.Content)
-				if sp.canPreview() {
+				textParts = append(textParts, event.Content) // always accumulate for history
+				if streamCard != nil && !streamCard.Failed() {
+					cardAnswerText.WriteString(event.Content)
+					_ = streamCard.Update(e.ctx, renderCardContent(cardAnswerText.String()))
+				} else if sp.canPreview() {
 					sp.appendText(event.Content)
 				}
 			}
@@ -2765,37 +2849,51 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			)
 
 			replyStart := time.Now()
-			normalizedResponse := strings.TrimSpace(fullResponse)
-			state.mu.Lock()
-			suppressDuplicate := normalizedResponse != "" && normalizedResponse == state.sideText
-			state.sideText = ""
-			state.mu.Unlock()
 
-			// When tool calls happened and prior text was already surfaced in segments,
-			// only send the unsent remainder. When tool progress is hidden, tool events don't surface
-			// side-channel messages and segmentStart stays 0, so keep normal finalize flow.
-			if toolCount > 0 && segmentStart > 0 {
-				sp.discard()
-				if segmentStart < len(textParts) {
-					unsent := strings.Join(textParts[segmentStart:], "")
-					if unsent != "" {
-						for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
-							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
-								return
-							}
+			if streamCard != nil && !streamCard.Failed() {
+				sp.finish("")
+				finalContent := renderCardContent(fullResponse)
+				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
+					slog.Error("streaming card finalize failed, sending fallback", "error", err)
+					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							return
 						}
 					}
 				}
-			} else if suppressDuplicate {
-				sp.discard()
-				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
-			} else if sp.finish(fullResponse) {
-				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
 			} else {
-				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "chunks", len(splitMessage(fullResponse, maxPlatformMessageLen)))
-				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
-					if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
-						return
+				normalizedResponse := strings.TrimSpace(fullResponse)
+				state.mu.Lock()
+				suppressDuplicate := normalizedResponse != "" && normalizedResponse == state.sideText
+				state.sideText = ""
+				state.mu.Unlock()
+
+				// When tool calls happened and prior text was already surfaced in segments,
+				// only send the unsent remainder. When tool progress is hidden, tool events
+				// don't surface side-channel messages and segmentStart stays 0.
+				if toolCount > 0 && segmentStart > 0 {
+					sp.discard()
+					if segmentStart < len(textParts) {
+						unsent := strings.Join(textParts[segmentStart:], "")
+						if unsent != "" {
+							for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
+								if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+									return
+								}
+							}
+						}
+					}
+				} else if suppressDuplicate {
+					sp.discard()
+					slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
+				} else if sp.finish(fullResponse) {
+					slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
+				} else {
+					slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "chunks", len(splitMessage(fullResponse, maxPlatformMessageLen)))
+					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							return
+						}
 					}
 				}
 			}
@@ -2903,6 +3001,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
+
+				// Reset streaming card state for the next turn
+				streamCard = nil
+				cardToolCalls = nil
+				cardThinkingText = ""
+				cardAnswerText.Reset()
+
+				// Try to create a new streaming card for the queued turn
+				if scp, ok := queued.platform.(StreamingCardPlatform); ok {
+					if sc, err := scp.CreateStreamingCard(e.ctx, queued.replyCtx); err != nil {
+						slog.Warn("streaming card creation failed for queued turn", "error", err)
+					} else {
+						streamCard = sc
+					}
+				}
 
 				session.AddHistory("user", queued.content)
 
