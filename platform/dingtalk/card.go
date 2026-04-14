@@ -71,7 +71,7 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 	if isGroup {
 		openSpaceId = fmt.Sprintf("dtv1.card//IM_GROUP.%s", rc.conversationId)
 	} else {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", p.robotCode)
+		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", rc.senderStaffId)
 	}
 
 	// Build card data
