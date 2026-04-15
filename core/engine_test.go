@@ -342,6 +342,59 @@ func (p *stubCompactProgressPlatform) getPreviewEdits() []string {
 	return out
 }
 
+type stubStreamingCardPlatform struct {
+	stubPlatformEngine
+	card *stubStreamingCard
+}
+
+func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any) (StreamingCard, error) {
+	p.card = &stubStreamingCard{}
+	return p.card, nil
+}
+
+type stubStreamingCard struct {
+	mu        sync.Mutex
+	updates   []string
+	finalized []string
+	failed    bool
+}
+
+func (c *stubStreamingCard) Update(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, content)
+	return nil
+}
+
+func (c *stubStreamingCard) Finalize(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finalized = append(c.finalized, content)
+	return nil
+}
+
+func (c *stubStreamingCard) Failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+
+func (c *stubStreamingCard) getUpdates() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.updates))
+	copy(out, c.updates)
+	return out
+}
+
+func (c *stubStreamingCard) getFinalized() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.finalized))
+	copy(out, c.finalized)
+	return out
+}
+
 type stubModelModeAgent struct {
 	stubAgent
 	model           string
@@ -976,6 +1029,51 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 	}
 	if sent[len(sent)-1] != "done" {
 		t.Fatalf("final message = %q, want done", sent[len(sent)-1])
+	}
+}
+
+func TestProcessInteractiveEvents_StreamingCardSuppressesStandaloneToolResults(t *testing.T) {
+	p := &stubStreamingCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true})
+	sessionKey := "dingtalk:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-card")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "hi"}
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-card", time.Now(), nil, nil, nil)
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no standalone messages when streaming card is active", got)
+	}
+	if p.card == nil {
+		t.Fatal("expected streaming card to be created")
+	}
+
+	updates := p.card.getUpdates()
+	if len(updates) == 0 {
+		t.Fatal("expected streaming card updates")
+	}
+	if !strings.Contains(updates[0], "Tool #1") || !strings.Contains(updates[0], "echo hi") {
+		t.Fatalf("first update = %q, want tool call rendered in card", updates[0])
+	}
+
+	finalized := p.card.getFinalized()
+	if len(finalized) != 1 {
+		t.Fatalf("finalized cards = %d, want 1", len(finalized))
+	}
+	if !strings.Contains(finalized[0], "done") {
+		t.Fatalf("final card = %q, want final response content", finalized[0])
 	}
 }
 

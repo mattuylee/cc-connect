@@ -2667,6 +2667,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolResult:
 			if e.display.ToolMessages {
+				if streamCard != nil && !streamCard.Failed() {
+					// Streaming-card platforms aggregate the whole turn into a single
+					// updatable card. Tool results should not fan out as standalone
+					// chat messages, otherwise card mode duplicates progress noise.
+					continue
+				}
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
 					result = strings.TrimSpace(event.Content)
